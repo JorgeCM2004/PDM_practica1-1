@@ -161,6 +161,39 @@ def apply_kmeans(
     return result
 
 
+def apply_car_car_motorcycle(data: pd.DataFrame) -> pd.DataFrame:
+    """Separa los coches y un candidato pequeño alejado de ambos.
+
+    Los 22 puntos conocidos orientan el tamaño, pero no identifican
+    por sí solos la moto: un fragmento del coche también puede tener 22.
+    """
+    labels = DBSCAN(eps=0.75, min_samples=3).fit_predict(
+        data[["x", "y", "z"]].to_numpy()
+    )
+    grouped = data.assign(group=labels)
+    sizes = grouped.groupby("group").size().drop(-1, errors="ignore")
+    car_groups = sizes[sizes > 100].nlargest(2).index
+    if len(car_groups) != 2:
+        raise ValueError("No se han encontrado los dos coches de esta escena.")
+    centers = grouped.groupby("group")[["x", "y", "z"]].mean()
+    candidates = []
+    for group_id in sizes[(sizes >= 16) & (sizes <= 33)].index:
+        distance = np.linalg.norm(
+            centers.loc[car_groups].to_numpy() - centers.loc[group_id].to_numpy(),
+            axis=1,
+        ).min()
+        if distance >= 10.0:
+            candidates.append(group_id)
+    if len(candidates) != 1:
+        raise ValueError("No hay un único candidato lejano compatible con la moto.")
+    motorcycle_id = candidates[0]
+    cars = apply_kmeans(data.loc[np.isin(labels, car_groups)].copy(), k=2)
+    motorcycle = data.loc[labels == motorcycle_id].copy()
+    motorcycle["cluster"] = 2
+    print(f"Candidato a moto lejano: {len(motorcycle)} puntos (referencia: 22).")
+    return pd.concat([cars, motorcycle]).sort_index()
+
+
 # ============================================================
 # MOSTRAR CLUSTERS
 # ============================================================
@@ -219,7 +252,8 @@ def show_clusters(
 
         print()
         print(
-            f"Vehículo {cluster_id + 1}"
+            ("Moto" if title == "coche_coche_moto.csv" and cluster_id == 2
+             else f"Vehículo {cluster_id + 1}")
         )
 
         print(
@@ -353,11 +387,20 @@ def process_file(
     # Quitar fondo
     # --------------------------------------------------------
 
-    data = remove_background(
-        data=data,
-        background=background,
-        threshold=300
-    )
+    if path.name == "coche_coche_moto.csv":
+        # Un fondo sin retorno (range=0) no demuestra que el punto sea fondo.
+        # Conservamos esos candidatos y eliminamos los grupos residuales después.
+        if len(data) != len(background):
+            raise ValueError("El frame y el fondo deben tener igual número de filas.")
+        current = data["range"].to_numpy(dtype=float)
+        reference = background["range"].to_numpy(dtype=float)
+        keep = (
+            np.isfinite(current) & np.isfinite(reference) & (current > 0)
+            & ((reference == 0) | ((reference > 0) & (reference - current > 300)))
+        )
+        data = data.loc[keep].copy()
+    else:
+        data = remove_background(data=data, background=background, threshold=300)
 
     print(
         f"Puntos después de quitar fondo: "
@@ -389,28 +432,31 @@ def process_file(
     # DBSCAN PARA QUITAR RUIDO
     # --------------------------------------------------------
 
-    data = remove_dbscan_noise(
-        data=data,
-        eps=NOISE_EPS,
-        min_samples=NOISE_MIN_SAMPLES
-    )
-
-    if len(data) == 0:
-
-        print(
-            "DBSCAN ha eliminado todos los puntos."
+    if path.name == "coche_coche_moto.csv":
+        data = apply_car_car_motorcycle(data)
+    else:
+        data = remove_dbscan_noise(
+            data=data,
+            eps=NOISE_EPS,
+            min_samples=NOISE_MIN_SAMPLES
         )
 
-        return
+        if len(data) == 0:
 
-    # --------------------------------------------------------
-    # K-MEANS
-    # --------------------------------------------------------
+            print(
+                "DBSCAN ha eliminado todos los puntos."
+            )
 
-    data = apply_kmeans(
-        data=data,
-        k=k
-    )
+            return
+
+        # --------------------------------------------------------
+        # K-MEANS
+        # --------------------------------------------------------
+
+        data = apply_kmeans(
+            data=data,
+            k=k
+        )
 
     # --------------------------------------------------------
     # Información
